@@ -7,6 +7,10 @@ A simple macOS **menu bar translator**:
 
 This is an Xcode project written in Swift.
 
+## Screenshot
+
+![Translator menu bar screenshot](<Screenshot 2026-01-21 at 3.05.45 PM.png>)
+
 ## Features
 
 - **Menu bar UI** with current target language

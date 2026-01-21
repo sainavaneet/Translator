@@ -70,15 +70,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         menu.addItem(NSMenuItem(title: "Translator", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
-        
-        let targetItem = NSMenuItem(title: "Target: \(targetLang.uppercased())", action: nil, keyEquivalent: "")
-        targetItem.isEnabled = false
-        menu.addItem(targetItem)
-        
-        let autoItem = NSMenuItem(title: "Auto-copy: \(autoCopyEnabled ? "ON" : "OFF")", action: nil, keyEquivalent: "")
-        autoItem.isEnabled = false
-        menu.addItem(autoItem)
-        
+
+        let manualTranslateItem = NSMenuItem(title: "Translate Text…", action: #selector(promptTranslateText), keyEquivalent: "t")
+        menu.addItem(manualTranslateItem)
         menu.addItem(.separator())
         
         let langMenu = NSMenu()
@@ -200,6 +194,87 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         
         self.statusItem.menu = menu
+    }
+
+    @objc func promptTranslateText() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Translate Text"
+        alert.informativeText = "Enter text to translate to \(targetLang.uppercased())."
+        alert.addButton(withTitle: "Translate")
+        alert.addButton(withTitle: "Cancel")
+
+        let accessoryWidth: CGFloat = 360
+        let accessoryHeight: CGFloat = 120
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 13)
+        textView.string = NSPasteboard.general.string(forType: .string) ?? ""
+
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn else { return }
+
+        let input = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
+
+        // Show quick feedback while translating
+        showInfo("Translating…")
+
+        detectLanguage(input) { [weak self] detectedLang in
+            guard let self else { return }
+            let fromLang = detectedLang ?? "auto"
+            let toLang = self.targetLang
+
+            Task {
+                let translated = await self.translateWithGoogle(text: input, from: fromLang, to: toLang)
+                await MainActor.run {
+                    guard let translated else {
+                        self.showInfo("Translation failed.\nCheck internet.")
+                        return
+                    }
+
+                    if self.autoCopyEnabled {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(translated, forType: .string)
+                        self.lastClipboard = translated
+                    }
+
+                    // Save to history
+                    let entry = TranslationEntry(
+                        original: input,
+                        translation: translated,
+                        from: fromLang,
+                        to: toLang,
+                        timestamp: Date()
+                    )
+                    self.translationHistory.insert(entry, at: 0)
+                    if self.translationHistory.count > self.maxHistoryItems {
+                        self.translationHistory.removeLast()
+                    }
+                    self.updateMenu()
+
+                    // Show result
+                    self.showPopover(
+                        original: input,
+                        translation: translated,
+                        from: fromLang,
+                        to: toLang,
+                        showBoth: true
+                    )
+                }
+            }
+        }
     }
     
     @objc func selectLanguage(_ sender: NSMenuItem) {
