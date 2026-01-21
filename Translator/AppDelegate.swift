@@ -216,11 +216,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
         textView.isRichText = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.allowsUndo = true
         textView.font = .systemFont(ofSize: 13)
         textView.string = NSPasteboard.general.string(forType: .string) ?? ""
+        textView.textContainer?.widthTracksTextView = true
+        textView.isHorizontallyResizable = false
 
         scrollView.documentView = textView
         alert.accessoryView = scrollView
+        alert.window.initialFirstResponder = textView
+        alert.window.makeFirstResponder(textView)
 
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else { return }
