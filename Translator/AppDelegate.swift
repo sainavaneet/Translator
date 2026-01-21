@@ -4,7 +4,7 @@ import NaturalLanguage
 import Network
 
 @main
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     
     var statusItem: NSStatusItem!
     var timer: Timer?
@@ -12,7 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var targetLang = "en"
     var autoCopyEnabled = false
     var isPaused = false
-    var popover: NSPopover!
+    var activePopovers: [NSPopover] = []
     
     // Translation history
     struct TranslationEntry {
@@ -43,10 +43,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.addSubview(customView)
             button.frame = customView.frame
         }
-        
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.contentViewController = PopoverViewController()
         
         updateMenu()
         updateStatusBarView()
@@ -296,6 +292,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoCopyEnabled.toggle()
         updateMenu()
         updateStatusBarView()
+        
+        if autoCopyEnabled {
+            refresh()
+            if let text = NSPasteboard.general.string(forType: .string),
+               !text.isEmpty,
+               text.count <= maxLength {
+                translateText(text)
+            }
+        }
     }
     
     @objc func togglePause() {
@@ -330,10 +335,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timer?.invalidate()
         timer = nil
         
-        // Close any open popover
-        if popover.isShown {
-            popover.performClose(nil)
-        }
+        // Close any open popovers
+        closeAllPopovers()
         
         // Restart monitoring
         startMonitoring()
@@ -386,23 +389,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func translateText(_ text: String) {
         detectLanguage(text) { [weak self] detectedLang in
             guard let self, let detectedLang else { return }
-            
+            let toLang = self.targetLanguage(for: detectedLang)
+
             // Skip if detected language matches target language
-            if detectedLang == self.targetLang {
+            if detectedLang == toLang {
                 self.lastClipboard = text
-                        return
-                    }
-                    
-            // Determine target language
-            let toLang = self.targetLang
+                return
+            }
 
             Task {
                 // Translate to target language
                 let translated = await self.translateWithGoogle(
                     text: text,
-                        from: detectedLang,
-                        to: toLang
-                    )
+                    from: detectedLang,
+                    to: toLang
+                )
                     
                 await MainActor.run {
                     guard let translated else {
@@ -424,6 +425,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(translated, forType: .string)
                         self.lastClipboard = translated
+
+                        self.updateTargetLanguageForFuture(detectedLang)
                         
                         // Add to history
                         let entry = TranslationEntry(
@@ -483,6 +486,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    private func targetLanguage(for detectedLang: String) -> String {
+        // Always translate non-English clipboard text to English.
+        if detectedLang != "en" {
+            return "en"
+        }
+        return targetLang
+    }
+
+    private func updateTargetLanguageForFuture(_ detectedLang: String) {
+        guard detectedLang != targetLang else { return }
+        targetLang = detectedLang
+        updateMenu()
+        updateStatusBarView()
     }
     
     func detectLanguage(_ text: String, completion: @escaping (String?) -> Void) {
@@ -557,42 +575,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     // MARK: - UI
+
+    func popoverDidClose(_ notification: Notification) {
+        if let pop = notification.object as? NSPopover {
+            removePopover(pop)
+        }
+    }
+    
+    private func createPopover() -> NSPopover {
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.delegate = self
+        
+        let vc = PopoverViewController()
+        vc.onClose = { [weak self, weak pop] in
+            guard let self, let pop else { return }
+            pop.performClose(nil)
+            self.removePopover(pop)
+        }
+        pop.contentViewController = vc
+        return pop
+    }
+    
+    private func removePopover(_ popover: NSPopover) {
+        if let index = activePopovers.firstIndex(where: { $0 === popover }) {
+            activePopovers.remove(at: index)
+        }
+    }
+    
+    private func closeAllPopovers() {
+        let open = activePopovers
+        activePopovers.removeAll()
+        for pop in open where pop.isShown {
+            pop.performClose(nil)
+        }
+    }
     
     func showPopover(original: String, translation: String, from: String, to: String, showBoth: Bool = false) {
         guard let button = statusItem.button else { return }
-            
-            if let vc = popover.contentViewController as? PopoverViewController {
+        
+        let pop = createPopover()
+        if let vc = pop.contentViewController as? PopoverViewController {
             vc.setContent(original: original, translation: translation, from: from, to: to, showBoth: showBoth)
-            }
-            
-        if popover.isShown { popover.performClose(nil) }
-            
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            
+        }
+        
+        activePopovers.append(pop)
+        pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        
         // Auto-close based on message length - longer display time
         let delay = showBoth ? min(max(12.0, Double(translation.count) / 25.0), 30.0) : min(max(10.0, Double(translation.count) / 30.0), 25.0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            self.popover.performClose(nil)
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak pop] in
+            guard let self, let pop else { return }
+            pop.performClose(nil)
+            self.removePopover(pop)
         }
+    }
     
     func showInfo(_ message: String) {
         guard let button = statusItem.button else { return }
-            
-            if let vc = popover.contentViewController as? PopoverViewController {
-                vc.setInfo(message)
-            }
-            
-        if popover.isShown { popover.performClose(nil) }
-            
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            
+        
+        let pop = createPopover()
+        if let vc = pop.contentViewController as? PopoverViewController {
+            vc.setInfo(message)
+        }
+        
+        activePopovers.append(pop)
+        pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        
         // Auto-close based on message length - longer display time
         let delay = min(max(8.0, Double(message.count) / 40.0), 20.0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            self.popover.performClose(nil)
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak pop] in
+            guard let self, let pop else { return }
+            pop.performClose(nil)
+            self.removePopover(pop)
         }
+    }
     
     // MARK: - Popover View
     
@@ -600,10 +657,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         private var containerView: NSView!
         private var titleLabel: NSTextField!
+        private var closeButton: NSButton!
         private var originalContainer: NSView!
         private var originalLabel: NSTextField!
         private var translationContainer: NSScrollView!
         private var translationLabel: NSTextField!
+        
+        var onClose: (() -> Void)?
         
         private let minWidth: CGFloat = 280
         private let maxWidth: CGFloat = 600
@@ -623,6 +683,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             titleLabel.alignment = .center
             titleLabel.textColor = .secondaryLabelColor
             containerView.addSubview(titleLabel)
+            
+            // Close button
+            closeButton = NSButton(title: "×", target: self, action: #selector(closeTapped))
+            closeButton.isBordered = false
+            closeButton.font = .systemFont(ofSize: 13, weight: .semibold)
+            closeButton.contentTintColor = .secondaryLabelColor
+            closeButton.focusRingType = .none
+            containerView.addSubview(closeButton)
             
             // Original text container (with background)
             originalContainer = NSView()
@@ -677,6 +745,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 y: height - 30,
                 width: width - padding * 2,
                 height: 20
+            )
+            
+            closeButton.frame = NSRect(
+                x: width - padding - 18,
+                y: height - 28,
+                width: 18,
+                height: 18
             )
             
             var currentY: CGFloat = padding
@@ -810,6 +885,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             view.frame.size = size
             
             updateLayout()
+        }
+        
+        @objc private func closeTapped() {
+            onClose?()
         }
     }
     
