@@ -12,6 +12,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var targetLang = "en"
     var autoCopyEnabled = false
     var isPaused = false
+    var isManualDialogOpen = false
     var activePopovers: [NSPopover] = []
     
     // Translation history
@@ -55,6 +56,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             pillView.languageCode = targetLang.uppercased()
             pillView.autoCopyEnabled = autoCopyEnabled
             pillView.isPaused = isPaused
+            pillView.isManualActive = isManualDialogOpen
             pillView.needsDisplay = true
         }
     }
@@ -78,6 +80,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ("ko", "Korean"),
             ("vi", "Vietnamese"),
             ("ja", "Japanese"),
+            ("th", "Thai"),
             ("de", "German"),
             ("fr", "French")
         ]
@@ -204,13 +207,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let accessoryWidth: CGFloat = 360
         let accessoryHeight: CGFloat = 120
 
+        let headerHeight: CGFloat = 28
+        let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight + headerHeight))
+        
+        let languagePopupWidth: CGFloat = 200
+        let languagePopup = NSPopUpButton(
+            frame: NSRect(x: 0, y: accessoryHeight, width: languagePopupWidth, height: headerHeight),
+            pullsDown: false
+        )
+        let languages = [
+            ("en", "English"),
+            ("es", "Spanish"),
+            ("ko", "Korean"),
+            ("vi", "Vietnamese"),
+            ("ja", "Japanese"),
+            ("th", "Thai"),
+            ("de", "German"),
+            ("fr", "French")
+        ]
+        for (_, name) in languages {
+            languagePopup.addItem(withTitle: name)
+        }
+        languagePopup.selectItem(withTitle: "English")
+        accessoryView.addSubview(languagePopup)
+        
+        let autoCopyButton = NSButton(checkboxWithTitle: "Auto-copy", target: nil, action: nil)
+        autoCopyButton.frame = NSRect(
+            x: languagePopupWidth + 8,
+            y: accessoryHeight + 2,
+            width: accessoryWidth - languagePopupWidth - 8,
+            height: headerHeight
+        )
+        autoCopyButton.state = autoCopyEnabled ? .on : .off
+        accessoryView.addSubview(autoCopyButton)
+        
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.borderType = .bezelBorder
 
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
+        let textView = ShortcutTextView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
         textView.isRichText = false
         textView.isEditable = true
         textView.isSelectable = true
@@ -221,11 +258,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         textView.isHorizontallyResizable = false
 
         scrollView.documentView = textView
-        alert.accessoryView = scrollView
+        accessoryView.addSubview(scrollView)
+        alert.accessoryView = accessoryView
         alert.window.initialFirstResponder = textView
         alert.window.makeFirstResponder(textView)
 
+        isManualDialogOpen = true
+        updateStatusBarView()
         let response = alert.runModal()
+        isManualDialogOpen = false
+        updateStatusBarView()
         guard response == .alertFirstButtonReturn else { return }
 
         let input = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -237,7 +279,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         detectLanguage(input) { [weak self] detectedLang in
             guard let self else { return }
             let fromLang = detectedLang ?? "auto"
-            let toLang = self.targetLang
+            let selectedIndex = languagePopup.indexOfSelectedItem
+            let toLang = (selectedIndex >= 0 && selectedIndex < languages.count) ? languages[selectedIndex].0 : "en"
 
             Task {
                 let translated = await self.translateWithGoogle(text: input, from: fromLang, to: toLang)
@@ -247,7 +290,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         return
                     }
 
-                    if self.autoCopyEnabled {
+                    if autoCopyButton.state == .on {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(translated, forType: .string)
                         self.lastClipboard = translated
@@ -279,6 +322,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
     }
+
     
     @objc func selectLanguage(_ sender: NSMenuItem) {
         if let code = sender.representedObject as? String {
@@ -891,6 +935,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             onClose?()
         }
     }
+
+    private class ShortcutTextView: NSTextView {
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard event.modifierFlags.contains(.command),
+                  let chars = event.charactersIgnoringModifiers?.lowercased()
+            else { return false }
+
+            switch chars {
+            case "a":
+                selectAll(nil)
+                return true
+            case "c":
+                copy(nil)
+                return true
+            case "v":
+                paste(nil)
+                return true
+            case "x":
+                cut(nil)
+                return true
+            default:
+                return false
+            }
+        }
+    }
     
     // MARK: - Status Bar Pill View
     
@@ -906,9 +975,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var isPaused: Bool = false {
             didSet { needsDisplay = true }
         }
+        var isManualActive: Bool = false {
+            didSet { needsDisplay = true }
+        }
         
         private let padding: CGFloat = 8
-        private let buttonWidth: CGFloat = 26
+        private let buttonWidth: CGFloat = 22
         private let buttonHeight: CGFloat = 18
         private let cornerRadius: CGFloat = 11
         private let buttonCornerRadius: CGFloat = 7
@@ -956,6 +1028,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             
             // Positions
             let langX = padding + 2
+            let tButtonX = bounds.width - buttonWidth * 3 - padding
             let aButtonX = bounds.width - buttonWidth * 2 - padding
             let pButtonX = bounds.width - buttonWidth - padding + 2
             let centerY = bounds.midY
@@ -970,9 +1043,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             langString.draw(at: NSPoint(x: langX, y: centerY - langSize.height / 2))
             
             // Buttons
+            let tButtonRect = NSRect(x: tButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
             let aButtonRect = NSRect(x: aButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
             let pButtonRect = NSRect(x: pButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
             
+            drawButton(text: "T", in: tButtonRect, isSelected: isManualActive, color: NSColor.systemBlue)
             drawButton(text: "A", in: aButtonRect, isSelected: autoCopyEnabled, color: NSColor.systemGreen)
             drawButton(text: "P", in: pButtonRect, isSelected: isPaused, color: NSColor.systemOrange)
         }
@@ -1020,6 +1095,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let location = locationInView.x.isNaN ? event.locationInWindow.x : locationInView.x
             let yLocation = locationInView.y.isNaN ? event.locationInWindow.y : locationInView.y
             
+            let tButtonX = bounds.width - buttonWidth * 3 - padding
             let aButtonX = bounds.width - buttonWidth * 2 - padding
             let pButtonX = bounds.width - buttonWidth - padding + 2
             let centerY = bounds.midY
@@ -1028,7 +1104,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             
             let isInButtonHeight = yLocation >= buttonYMin && yLocation <= buttonYMax
             
-            if isInButtonHeight && location >= aButtonX && location < (aButtonX + buttonWidth) {
+            if isInButtonHeight && location >= tButtonX && location < (tButtonX + buttonWidth) {
+                appDelegate?.promptTranslateText()
+            } else if isInButtonHeight && location >= aButtonX && location < (aButtonX + buttonWidth) {
                 appDelegate?.toggleAutoCopy()
             } else if isInButtonHeight && location >= pButtonX && location <= (pButtonX + buttonWidth) {
                 appDelegate?.togglePause()
