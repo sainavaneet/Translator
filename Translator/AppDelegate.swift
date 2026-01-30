@@ -471,7 +471,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         self.lastClipboard = translated
 
                         self.updateTargetLanguageForFuture(detectedLang)
-                        
+
                         // Add to history
                         let entry = TranslationEntry(
                             original: text,
@@ -541,7 +541,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func updateTargetLanguageForFuture(_ detectedLang: String) {
-        guard detectedLang != targetLang else { return }
+        // Only switch target when the source is not English.
+        guard detectedLang != "en", detectedLang != targetLang else { return }
         targetLang = detectedLang
         updateMenu()
         updateStatusBarView()
