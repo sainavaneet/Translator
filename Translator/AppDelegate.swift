@@ -1,7 +1,6 @@
 
 import Cocoa
 import NaturalLanguage
-import Network
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
@@ -283,7 +282,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let toLang = (selectedIndex >= 0 && selectedIndex < languages.count) ? languages[selectedIndex].0 : "en"
 
             Task {
-                let translated = await self.translateWithGoogle(text: input, from: fromLang, to: toLang)
+                let translated = await self.translateWithOllama(text: input, from: fromLang, to: toLang)
                 await MainActor.run {
                     guard let translated else {
                         self.showInfo("Translation failed.\nCheck internet.")
@@ -442,8 +441,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
 
             Task {
-                // Translate to target language
-                let translated = await self.translateWithGoogle(
+                // Translate to target language via Ollama
+                let translated = await self.translateWithOllama(
                     text: text,
                     from: detectedLang,
                     to: toLang
@@ -452,12 +451,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 await MainActor.run {
                     guard let translated else {
                         Task {
-                            let dnsOK = await self.checkDNS()
+                            let ollamaOK = await self.checkOllamaRunning()
                             await MainActor.run {
                                 self.showInfo(
-                                    dnsOK
-                                    ? "Translation failed.\nCheck internet."
-                                    : "DNS is broken.\n\nFix:\n• Toggle Wi-Fi\n• Restart Mac\n• Use 8.8.8.8"
+                                    ollamaOK
+                                    ? "Translation failed.\nOllama returned no result."
+                                    : "Ollama is not running.\n\nFix:\n• Run: ollama serve\n• Or open Ollama app"
                                 )
                             }
                         }
@@ -554,41 +553,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         completion(recognizer.dominantLanguage?.rawValue)
     }
     
-    // MARK: - Google Translate
+    // MARK: - Ollama Translation
 
-    func translateWithGoogle(
+    func translateWithOllama(
         text: String,
         from sourceLang: String,
         to targetLang: String
     ) async -> String? {
+        let langName = languageName(for: targetLang)
 
-        guard let encoded = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
-            return nil
-        }
+        let prompt = """
+        Rephrase the following text so it sounds natural and fluent, then translate it into \(langName).
+        Output ONLY the final translated text. No labels, no explanations, no extra words.
 
-        let urlString =
-        "https://translate.googleapis.com/translate_a/single?client=gtx&sl=\(sourceLang)&tl=\(targetLang)&dt=t&q=\(encoded)"
+        \(text)
+        """
 
-        guard let url = URL(string: urlString) else { return nil }
+        let requestBody: [String: Any] = [
+            "model": "mistral",
+            "prompt": prompt,
+            "stream": false
+        ]
+
+        guard
+            let url = URL(string: "http://localhost:11434/api/generate"),
+            let jsonData = try? JSONSerialization.data(withJSONObject: requestBody)
+        else { return nil }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jsonData
+        request.timeoutInterval = 120
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
-
-            if let json = try JSONSerialization.jsonObject(with: data) as? [Any],
-               let arr = json.first as? [Any] {
-
-                var result = ""
-                for seg in arr {
-                    if let segArr = seg as? [Any],
-                       let txt = segArr.first as? String {
-                        result += txt
-                    }
-                }
-                return result.isEmpty ? nil : result
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let response = json["response"] as? String {
+                let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
             }
         } catch {
             return nil
@@ -596,26 +599,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return nil
     }
 
-    // MARK: - DNS Check (Correct)
-
-    func checkDNS() async -> Bool {
-        await withCheckedContinuation { cont in
-            let endpoint = NWEndpoint.hostPort(host: "www.google.com", port: 443)
-            let conn = NWConnection(to: endpoint, using: .tcp)
-
-            conn.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    conn.cancel()
-                    cont.resume(returning: true)
-                case .failed:
-                    conn.cancel()
-                    cont.resume(returning: false)
-                default:
-                    break
+    private func languageName(for code: String) -> String {
+        switch code {
+        case "en": return "English"
+        case "es": return "Spanish"
+        case "ko": return "Korean"
+        case "vi": return "Vietnamese"
+        case "ja": return "Japanese"
+        case "th": return "Thai"
+        case "de": return "German"
+        case "fr": return "French"
+        default:
+            return Locale.current.localizedString(forLanguageCode: code) ?? code
         }
     }
-            conn.start(queue: .global())
+
+    // MARK: - Ollama Health Check
+
+    func checkOllamaRunning() async -> Bool {
+        guard let url = URL(string: "http://localhost:11434/api/tags") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
         }
     }
     
