@@ -6,14 +6,12 @@ import NaturalLanguage
 class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     
     var statusItem: NSStatusItem!
-    var timer: Timer?
-    var lastClipboard = ""
     var targetLang = "en"
     var autoCopyEnabled = false
-    var isPaused = false
     var isManualDialogOpen = false
     var activePopovers: [NSPopover] = []
-    
+    var isTranslating = false
+
     // Translation history
     struct TranslationEntry {
         let original: String
@@ -24,9 +22,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     var translationHistory: [TranslationEntry] = []
     let maxHistoryItems = 3
-    
+
     let maxLength = 4000
-    let pollInterval = 0.4
 
     // MARK: - App Lifecycle
     
@@ -46,16 +43,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         
         updateMenu()
         updateStatusBarView()
-        startMonitoring()
     }
     
     func updateStatusBarView() {
         if let button = statusItem.button,
            let pillView = button.subviews.first as? StatusBarPillView {
             pillView.languageCode = targetLang.uppercased()
-            pillView.autoCopyEnabled = autoCopyEnabled
-            pillView.isPaused = isPaused
             pillView.isManualActive = isManualDialogOpen
+            pillView.isTranslating = isTranslating
             pillView.needsDisplay = true
         }
     }
@@ -80,10 +75,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ("vi", "Vietnamese"),
             ("ja", "Japanese"),
             ("th", "Thai"),
+            ("tl", "Tagalog"),
             ("de", "German"),
             ("fr", "French")
         ]
-        
+
         for (code, name) in languages {
             let item = NSMenuItem(title: name, action: #selector(selectLanguage(_:)), keyEquivalent: "")
             item.representedObject = code
@@ -97,12 +93,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         
         menu.addItem(.separator())
         
-        let autoToggle = NSMenuItem(title: "Auto-copy Translation", action: #selector(toggleAutoCopy), keyEquivalent: "a")
-        autoToggle.state = autoCopyEnabled ? .on : .off
-        menu.addItem(autoToggle)
-        
-        let pauseItem = NSMenuItem(title: isPaused ? "Resume" : "Pause", action: #selector(togglePause), keyEquivalent: "p")
-        menu.addItem(pauseItem)
+        let translateClipboardItem = NSMenuItem(title: "Translate Clipboard", action: #selector(translateClipboard), keyEquivalent: "g")
+        menu.addItem(translateClipboardItem)
 
         menu.addItem(.separator())
         
@@ -221,6 +213,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             ("vi", "Vietnamese"),
             ("ja", "Japanese"),
             ("th", "Thai"),
+            ("tl", "Tagalog"),
             ("de", "German"),
             ("fr", "French")
         ]
@@ -282,7 +275,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let toLang = (selectedIndex >= 0 && selectedIndex < languages.count) ? languages[selectedIndex].0 : "en"
 
             Task {
-                let translated = await self.translateWithOllama(text: input, from: fromLang, to: toLang)
+                let translated = await self.translateWithGoogle(text: input, from: fromLang, to: toLang)
                 await MainActor.run {
                     guard let translated else {
                         self.showInfo("Translation failed.\nCheck internet.")
@@ -292,7 +285,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     if autoCopyButton.state == .on {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(translated, forType: .string)
-                        self.lastClipboard = translated
                     }
 
                     // Save to history
@@ -331,27 +323,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
     
-    @objc func toggleAutoCopy() {
-        autoCopyEnabled.toggle()
-        updateMenu()
-        updateStatusBarView()
-        
-        if autoCopyEnabled {
-            refresh()
-            if let text = NSPasteboard.general.string(forType: .string),
-               !text.isEmpty,
-               text.count <= maxLength {
-                translateText(text)
-            }
-        }
-    }
-    
-    @objc func togglePause() {
-        isPaused.toggle()
-        updateMenu()
-        updateStatusBarView()
-    }
-    
     @objc func copyOriginal(_ sender: NSMenuItem) {
         if let index = sender.representedObject as? Int,
            index < translationHistory.count {
@@ -371,20 +342,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
     
     @objc func refresh() {
-        // Clear clipboard tracking
-        lastClipboard = ""
-        
-        // Stop current monitoring
-        timer?.invalidate()
-        timer = nil
-        
-        // Close any open popovers
         closeAllPopovers()
-        
-        // Restart monitoring
-        startMonitoring()
-        
-        // Update UI
         updateMenu()
         updateStatusBarView()
     }
@@ -393,158 +351,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApplication.shared.terminate(nil)
     }
     
-    // MARK: - Clipboard Monitoring
-    
-    func startMonitoring() {
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.checkClipboard()
-        }
-    }
-    
-    func checkClipboard() {
-        guard !isPaused else { return }
-        
-        let pb = NSPasteboard.general
-        guard
-            let text = pb.string(forType: .string),
-            !text.isEmpty,
-            text != lastClipboard,
-            text.count <= maxLength
-        else { return }
-        
-        let lower = text.lowercased()
+    // MARK: - Manual Translation
 
-        // Skip system / error spam
-        if lower.contains("nsurlerrordomain") ||
-           lower.contains("could not be found") ||
-           lower.contains("resolved 0 endpoints") ||
-           lower.contains("fatal error") {
-            lastClipboard = text
+    @objc func translateClipboard() {
+        guard !isTranslating else { return }
+        guard let text = NSPasteboard.general.string(forType: .string),
+              !text.isEmpty, text.count <= maxLength else {
+            showInfo("Nothing to translate.\nCopy some text first.")
             return
         }
 
-        lastClipboard = text
-        translateText(text)
-    }
-    
-    // MARK: - Translation
-    
-    func translateText(_ text: String) {
-        detectLanguage(text) { [weak self] detectedLang in
-            guard let self, let detectedLang else { return }
-            let toLang = self.targetLanguage(for: detectedLang)
+        isTranslating = true
+        updateStatusBarView()
+        showInfo("Translating…")
 
-            // Skip if detected language matches target language
-            if detectedLang == toLang {
-                self.lastClipboard = text
-                return
-            }
+        detectLanguage(text) { [weak self] detectedLang in
+            guard let self else { return }
+            let fromLang = detectedLang ?? "auto"
+            let toLang = self.targetLang
 
             Task {
-                // Translate to target language via Ollama
-                let translated = await self.translateWithOllama(
-                    text: text,
-                    from: detectedLang,
-                    to: toLang
-                )
-                    
+                let translated = await self.translateWithGoogle(text: text, from: fromLang, to: toLang)
                 await MainActor.run {
+                    self.isTranslating = false
+                    self.updateStatusBarView()
+
                     guard let translated else {
-                        Task {
-                            let ollamaOK = await self.checkOllamaRunning()
-                            await MainActor.run {
-                                self.showInfo(
-                                    ollamaOK
-                                    ? "Translation failed.\nOllama returned no result."
-                                    : "Ollama is not running.\n\nFix:\n• Run: ollama serve\n• Or open Ollama app"
-                                )
-                            }
-                        }
+                        self.showInfo("Translation failed.\nCheck internet.")
                         return
                     }
 
-                    // If auto-copy is enabled: copy the translation and show it
-                    if self.autoCopyEnabled {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(translated, forType: .string)
-                        self.lastClipboard = translated
+                    // Always copy the translation
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(translated, forType: .string)
 
-                        self.updateTargetLanguageForFuture(detectedLang)
-
-                        // Add to history
-                        let entry = TranslationEntry(
-                            original: text,
-                            translation: translated,
-                            from: detectedLang,
-                            to: toLang,
-                            timestamp: Date()
-                        )
-                        self.translationHistory.insert(entry, at: 0)
-                        if self.translationHistory.count > self.maxHistoryItems {
-                            self.translationHistory.removeLast()
-                        }
-                        
-                        // Show popover with both original and translation
-                        self.showPopover(
-                            original: text,
-                            translation: translated,
-                            from: detectedLang,
-                            to: toLang,
-                            showBoth: true
-                        )
-                        
-                        // Update menu to show history
-                        self.updateMenu()
-                    } else {
-                        // If auto-copy is disabled
-                        self.lastClipboard = text
-                        
-                        // Always show a single translation in the selected target language.
-                        let entry = TranslationEntry(
-                            original: text,
-                            translation: translated,
-                            from: detectedLang,
-                            to: toLang,
-                            timestamp: Date()
-                        )
-                        self.translationHistory.insert(entry, at: 0)
-                        if self.translationHistory.count > self.maxHistoryItems {
-                            self.translationHistory.removeLast()
-                        }
-                        
-                        self.showPopover(
-                            original: text,
-                            translation: translated,
-                            from: detectedLang,
-                            to: toLang,
-                            showBoth: true
-                        )
-                        
-                        // Update menu to show history
-                        self.updateMenu()
+                    // Save to history
+                    let entry = TranslationEntry(
+                        original: text,
+                        translation: translated,
+                        from: fromLang,
+                        to: toLang,
+                        timestamp: Date()
+                    )
+                    self.translationHistory.insert(entry, at: 0)
+                    if self.translationHistory.count > self.maxHistoryItems {
+                        self.translationHistory.removeLast()
                     }
-                    
-                    // Update menu to show history
                     self.updateMenu()
+
+                    self.showPopover(
+                        original: text,
+                        translation: translated,
+                        from: fromLang,
+                        to: toLang,
+                        showBoth: true
+                    )
                 }
             }
         }
-    }
-
-    private func targetLanguage(for detectedLang: String) -> String {
-        // Always translate non-English clipboard text to English.
-        if detectedLang != "en" {
-            return "en"
-        }
-        return targetLang
-    }
-
-    private func updateTargetLanguageForFuture(_ detectedLang: String) {
-        // Only switch target when the source is not English.
-        guard detectedLang != "en", detectedLang != targetLang else { return }
-        targetLang = detectedLang
-        updateMenu()
-        updateStatusBarView()
     }
     
     func detectLanguage(_ text: String, completion: @escaping (String?) -> Void) {
@@ -553,45 +417,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         completion(recognizer.dominantLanguage?.rawValue)
     }
     
-    // MARK: - Ollama Translation
+    // MARK: - Google Translate
 
-    func translateWithOllama(
+    func translateWithGoogle(
         text: String,
         from sourceLang: String,
         to targetLang: String
     ) async -> String? {
-        let langName = languageName(for: targetLang)
 
-        let prompt = """
-        Rephrase the following text so it sounds natural and fluent, then translate it into \(langName).
-        Output ONLY the final translated text. No labels, no explanations, no extra words.
+        guard let encoded = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            return nil
+        }
 
-        \(text)
-        """
+        let urlString =
+        "https://translate.googleapis.com/translate_a/single?client=gtx&sl=\(sourceLang)&tl=\(targetLang)&dt=t&q=\(encoded)"
 
-        let requestBody: [String: Any] = [
-            "model": "mistral",
-            "prompt": prompt,
-            "stream": false
-        ]
-
-        guard
-            let url = URL(string: "http://localhost:11434/api/generate"),
-            let jsonData = try? JSONSerialization.data(withJSONObject: requestBody)
-        else { return nil }
+        guard let url = URL(string: urlString) else { return nil }
 
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-        request.timeoutInterval = 120
+        request.timeoutInterval = 10
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let response = json["response"] as? String {
-                let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
+
+            if let json = try JSONSerialization.jsonObject(with: data) as? [Any],
+               let arr = json.first as? [Any] {
+
+                var result = ""
+                for seg in arr {
+                    if let segArr = seg as? [Any],
+                       let txt = segArr.first as? String {
+                        result += txt
+                    }
+                }
+                return result.isEmpty ? nil : result
             }
         } catch {
             return nil
@@ -599,35 +459,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return nil
     }
 
-    private func languageName(for code: String) -> String {
-        switch code {
-        case "en": return "English"
-        case "es": return "Spanish"
-        case "ko": return "Korean"
-        case "vi": return "Vietnamese"
-        case "ja": return "Japanese"
-        case "th": return "Thai"
-        case "de": return "German"
-        case "fr": return "French"
-        default:
-            return Locale.current.localizedString(forLanguageCode: code) ?? code
-        }
-    }
-
-    // MARK: - Ollama Health Check
-
-    func checkOllamaRunning() async -> Bool {
-        guard let url = URL(string: "http://localhost:11434/api/tags") else { return false }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 3
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse)?.statusCode == 200
-        } catch {
-            return false
-        }
-    }
-    
     // MARK: - UI
 
     func popoverDidClose(_ notification: Notification) {
@@ -979,10 +810,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var languageCode: String = "ES" {
             didSet { needsDisplay = true }
         }
-        var autoCopyEnabled: Bool = false {
-            didSet { needsDisplay = true }
-        }
-        var isPaused: Bool = false {
+        var isTranslating: Bool = false {
             didSet { needsDisplay = true }
         }
         var isManualActive: Bool = false {
@@ -1038,11 +866,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             
             // Positions
             let langX = padding + 2
-            let tButtonX = bounds.width - buttonWidth * 3 - padding
-            let aButtonX = bounds.width - buttonWidth * 2 - padding
-            let pButtonX = bounds.width - buttonWidth - padding + 2
+            let tButtonX = bounds.width - buttonWidth * 2 - padding
+            let goButtonX = bounds.width - buttonWidth - padding + 2
             let centerY = bounds.midY
-            
+
             // Language code
             let langAttributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
@@ -1051,15 +878,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let langString = NSAttributedString(string: languageCode, attributes: langAttributes)
             let langSize = langString.size()
             langString.draw(at: NSPoint(x: langX, y: centerY - langSize.height / 2))
-            
+
             // Buttons
             let tButtonRect = NSRect(x: tButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
-            let aButtonRect = NSRect(x: aButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
-            let pButtonRect = NSRect(x: pButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
-            
+            let goButtonRect = NSRect(x: goButtonX, y: centerY - buttonHeight / 2, width: buttonWidth, height: buttonHeight)
+
             drawButton(text: "T", in: tButtonRect, isSelected: isManualActive, color: NSColor.systemBlue)
-            drawButton(text: "A", in: aButtonRect, isSelected: autoCopyEnabled, color: NSColor.systemGreen)
-            drawButton(text: "P", in: pButtonRect, isSelected: isPaused, color: NSColor.systemOrange)
+            drawButton(text: "⇄", in: goButtonRect, isSelected: isTranslating, color: NSColor.systemPurple)
         }
         
         private func drawButton(text: String, in rect: NSRect, isSelected: Bool, color: NSColor) {
@@ -1105,21 +930,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let location = locationInView.x.isNaN ? event.locationInWindow.x : locationInView.x
             let yLocation = locationInView.y.isNaN ? event.locationInWindow.y : locationInView.y
             
-            let tButtonX = bounds.width - buttonWidth * 3 - padding
-            let aButtonX = bounds.width - buttonWidth * 2 - padding
-            let pButtonX = bounds.width - buttonWidth - padding + 2
+            let tButtonX = bounds.width - buttonWidth * 2 - padding
+            let goButtonX = bounds.width - buttonWidth - padding + 2
             let centerY = bounds.midY
             let buttonYMin = centerY - buttonHeight / 2
             let buttonYMax = centerY + buttonHeight / 2
-            
+
             let isInButtonHeight = yLocation >= buttonYMin && yLocation <= buttonYMax
-            
+
             if isInButtonHeight && location >= tButtonX && location < (tButtonX + buttonWidth) {
                 appDelegate?.promptTranslateText()
-            } else if isInButtonHeight && location >= aButtonX && location < (aButtonX + buttonWidth) {
-                appDelegate?.toggleAutoCopy()
-            } else if isInButtonHeight && location >= pButtonX && location <= (pButtonX + buttonWidth) {
-                appDelegate?.togglePause()
+            } else if isInButtonHeight && location >= goButtonX && location <= (goButtonX + buttonWidth) {
+                appDelegate?.translateClipboard()
             } else {
                 if let button = superview as? NSStatusBarButton {
                     button.performClick(nil)
